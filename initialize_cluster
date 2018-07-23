@@ -1,0 +1,69 @@
+#!/bin/bash
+# Run on boot once
+
+set -eux
+if [ -f /etc/systemd/system/etcd.service.d/restart.conf ]; then
+    exit 0
+fi
+
+groupadd -r docker
+
+# Setup etcd
+
+cluster=a1=http://192.16.122.158:2380,\
+        a2=http://192.16.122.173:2380,\
+        a3=http://192.16.122.47:2380, \
+        a4=http://192.16.122.103:2380
+
+host=$(grep local-hostname /var/cloud-init/meta-data | cut -d: -f2 | tr -d [:space:])
+host=${host%%.*}
+
+ip=${cluster#*$host=}
+ip=${ip%%:2380*}
+ip=${ip#*//}
+
+mv /etc/etcd/etcd.conf /etc/etcd/etcd.conf.save
+cat <<EOF >/etc/etcd/etcd.conf
+# [member]
+ETCD_NAME=$host
+ETCD_DATA_DIR="/var/lib/etcd/$host.etcd"
+ETCD_LISTEN_PEER_URLS="http://$ip:2380"
+ETCD_LISTEN_CLIENT_URLS="http://localhost:2379,http://$ip:2379"
+#[cluster]
+ETCD_INITIAL_ADVERTISE_PEER_URLS="http://$ip:2380"
+ETCD_INITIAL_CLUSTER="$cluster"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_INITIAL_CLUSTER_TOKEN="diy-cluster"
+ETCD_ADVERTISE_CLIENT_URLS="http://$ip:2379"
+EOF
+
+mkdir /etc/systemd/system/etcd.service.d
+cat <<EOF >/etc/systemd/system/etcd.service.d/restart.conf
+[Service]
+Restart=on-failure
+RestartSec=1
+EOF
+
+# Setup flannel
+
+mv /etc/sysconfig/flanneld /etc/sysconfig/flanneld.save
+cat <<EOF >/etc/sysconfig/flanneld
+FLANNEL_ETCD=http://127.0.0.1:2379
+FLANNEL_ETCD_KEY=/admin/flannel
+EOF
+
+mkdir /etc/systemd/system/flanneld.service.d
+cat <<EOF >/etc/systemd/system/flanneld.service.d/init.conf
+[Service]
+ExecStartPre=/usr/bin/etcdctl set /admin/flannel/config \
+            {\"Network\":\"172.18.0.0/16\"}
+Restart=on-failure
+RestartSec=1
+EOF
+
+# Restart
+
+systemctl daemon-reload
+systemctl enable etcd.service
+systemctl enable flanneld.service
+systemctl reboot
